@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+/debug/
+/release/
+**/*.rs.bk
+
+# Cargo and build helpers
+/.cargo/
+/vendor/
+
+# Binaries and symbols (Windows/MSVC)
+*.exe
+*.dll
+*.pdb
+
+# Editor and tooling
+/.vscode/
+/.idea/
+*.iml
+*.sw?
+*.swo
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+*.tmp
+
