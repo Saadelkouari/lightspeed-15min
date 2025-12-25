@@ -2,8 +2,12 @@ use crate::config::DatabaseConfig;
 use crate::orderbook::Orderbook;
 use crate::btc::BtcTicker;
 use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_postgres::{Client, NoTls};
+use ureq;
 
 #[derive(Clone, Debug)]
 pub struct DbLogger {
@@ -20,8 +24,9 @@ enum DbEvent {
 #[derive(Debug)]
 struct PolymarketEvent {
     asset_label: String,
+    side: Side,
     asset_id: String,
-    market: String,
+    market_id: String,
     best_bid_price: Option<f64>,
     best_bid_qty: Option<f64>,
     best_ask_price: Option<f64>,
@@ -36,6 +41,29 @@ struct BtcEvent {
     volume: f64,
     event_ts_ms: i64,
     received_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+enum Side {
+    Up,
+    Down,
+}
+
+impl Side {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Side::Up => "UP",
+            Side::Down => "DOWN",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.to_ascii_lowercase().as_str() {
+            "up" => Some(Side::Up),
+            "down" => Some(Side::Down),
+            _ => None,
+        }
+    }
 }
 
 impl DbLogger {
@@ -68,6 +96,14 @@ impl DbLogger {
             return;
         }
 
+        let side = match asset_label.and_then(Side::from_label) {
+            Some(s) => s,
+            None => {
+                eprintln!("⚠️  Skipping polymarket log: missing/unknown side for asset_id={}", ob.asset_id);
+                return;
+            }
+        };
+
         let best_bid = ob
             .bids
             .last()
@@ -79,8 +115,9 @@ impl DbLogger {
 
         let event = PolymarketEvent {
             asset_label: asset_label.unwrap_or("UNKNOWN").to_string(),
+            side,
             asset_id: ob.asset_id.clone(),
-            market: ob.market.clone(),
+            market_id: ob.market.clone(), // websocket field is the market id
             best_bid_price: best_bid.map(|(p, _)| p),
             best_bid_qty: best_bid.map(|(_, q)| q),
             best_ask_price: best_ask.map(|(p, _)| p),
@@ -114,6 +151,7 @@ impl DbLogger {
 
 async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedReceiver<DbEvent>) -> Result<()> {
     let mut pending: Option<DbEvent> = None;
+    let mut market_slug_cache: HashMap<String, Option<String>> = HashMap::new();
 
     loop {
         let (client, connection) = match tokio_postgres::connect(&url, NoTls).await {
@@ -150,7 +188,11 @@ async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedRecei
             };
 
             let result = match &event {
-                DbEvent::Polymarket(ev) => insert_polymarket(&mut client, ev).await,
+                DbEvent::Polymarket(ev) => {
+                    // Resolve slug once per market id and cache
+                    let slug = resolve_market_slug(&ev.market_id, &mut market_slug_cache).await;
+                    insert_polymarket(&mut client, ev, slug.as_deref()).await
+                }
                 DbEvent::Btc(ev) => insert_btc(&mut client, ev).await,
             };
 
@@ -179,8 +221,10 @@ async fn ensure_schema(client: &Client) -> Result<()> {
             CREATE TABLE IF NOT EXISTS polymarket_orderbook_events (
                 id BIGSERIAL PRIMARY KEY,
                 asset_label TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('UP','DOWN')),
                 asset_id TEXT NOT NULL,
                 market TEXT NOT NULL,
+                market_instance_id TEXT,
                 best_bid_price DOUBLE PRECISION,
                 best_bid_qty DOUBLE PRECISION,
                 best_ask_price DOUBLE PRECISION,
@@ -189,6 +233,13 @@ async fn ensure_schema(client: &Client) -> Result<()> {
                 received_at_ms BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            ALTER TABLE polymarket_orderbook_events
+            ADD COLUMN IF NOT EXISTS market_instance_id TEXT;
+            ALTER TABLE polymarket_orderbook_events
+            ADD COLUMN IF NOT EXISTS side TEXT;
+            ALTER TABLE polymarket_orderbook_events
+            ADD CONSTRAINT IF NOT EXISTS polymarket_orderbook_events_side_check CHECK (side IN ('UP','DOWN'));
 
             CREATE TABLE IF NOT EXISTS btc_ticks (
                 id BIGSERIAL PRIMARY KEY,
@@ -204,26 +255,34 @@ async fn ensure_schema(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn insert_polymarket(client: &mut Client, ev: &PolymarketEvent) -> Result<()> {
+async fn insert_polymarket(
+    client: &mut Client,
+    ev: &PolymarketEvent,
+    market_slug: Option<&str>,
+) -> Result<()> {
     client
         .execute(
             r#"
             INSERT INTO polymarket_orderbook_events (
                 asset_label,
+                side,
                 asset_id,
                 market,
+                market_instance_id,
                 best_bid_price,
                 best_bid_qty,
                 best_ask_price,
                 best_ask_qty,
                 event_timestamp_ms,
                 received_at_ms
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         "#,
             &[
                 &ev.asset_label,
+                &ev.side.as_str(),
                 &ev.asset_id,
-                &ev.market,
+                &ev.market_id,
+                &market_slug,
                 &ev.best_bid_price,
                 &ev.best_bid_qty,
                 &ev.best_ask_price,
@@ -235,6 +294,47 @@ async fn insert_polymarket(client: &mut Client, ev: &PolymarketEvent) -> Result<
         .await
         .map(|_| ())
         .map_err(|e| e.into())
+}
+
+const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
+
+#[derive(Deserialize)]
+struct MarketDetail {
+    slug: Option<String>,
+}
+
+async fn resolve_market_slug(
+    market_id: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = cache.get(market_id) {
+        return cached.clone();
+    }
+
+    let fetched = fetch_market_slug(market_id).await.unwrap_or(None);
+    cache.insert(market_id.to_string(), fetched.clone());
+    fetched
+}
+
+async fn fetch_market_slug(market_id: &str) -> Result<Option<String>> {
+    let market_id = market_id.to_string();
+    let res = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let url = format!("{}/markets/{}", GAMMA_API_BASE, market_id);
+        let response = ureq::get(&url)
+            .timeout(Duration::from_secs(10))
+            .call()?;
+
+        if response.status() == 404 {
+            return Ok(None);
+        }
+
+        let detail: MarketDetail = response.into_json()?;
+        Ok(detail.slug)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("JoinError fetching market slug: {e}"))??;
+
+    Ok(res)
 }
 
 async fn insert_btc(client: &mut Client, ev: &BtcEvent) -> Result<()> {
