@@ -107,6 +107,8 @@ async fn run_polymarket(config: AppConfig) -> Result<()> {
             return Err(e);
         }
     };
+    // Seed slug cache for DB logger to avoid re-fetch churn.
+    db_logger.cache_market_slug(&market_info.market_id, &used_slug);
 
     // Create WebSocket client
     let ws_client = Arc::new(WebSocketClient::new(WS_URL.to_string()));
@@ -314,6 +316,8 @@ async fn run_logging(config: AppConfig) -> Result<()> {
         let mut ob = orderbook_state.write().await;
         ob.set_binary_labels(&market_info.token_ids);
     }
+    // Seed slug cache for DB logger to avoid re-fetch churn.
+    db_logger.cache_market_slug(&market_info.market_id, &used_slug);
     let ws_client = Arc::new(WebSocketClient::new(WS_URL.to_string()));
     ws_client.connect_market(&market_info.token_ids).await?;
 

@@ -3,6 +3,7 @@ use crate::orderbook::Orderbook;
 use crate::btc::BtcTicker;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::{self, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -19,6 +20,7 @@ pub struct DbLogger {
 enum DbEvent {
     Polymarket(PolymarketEvent),
     Btc(BtcEvent),
+    CacheSlug { market_id: String, slug: String },
 }
 
 #[derive(Debug)]
@@ -131,6 +133,22 @@ impl DbLogger {
         }
     }
 
+    /// Seed the market slug cache so the worker doesn't have to re-fetch.
+    pub fn cache_market_slug(&self, market_id: &str, slug: &str) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+        if let Err(e) = self.tx.send(DbEvent::CacheSlug {
+            market_id: market_id.to_string(),
+            slug: slug.to_string(),
+        }) {
+            eprintln!(
+                "⚠️  Failed to enqueue cache seed for market_id={} slug={}: {e}",
+                market_id, slug
+            );
+        }
+    }
+
     pub fn log_btc_ticker(&self, tick: &BtcTicker) {
         if !self.cfg.logging_enabled {
             return;
@@ -191,9 +209,23 @@ async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedRecei
                 DbEvent::Polymarket(ev) => {
                     // Resolve slug once per market id and cache
                     let slug = resolve_market_slug(&ev.market_id, &mut market_slug_cache).await;
+                    if slug.is_none() {
+                        eprintln!(
+                            "⚠️  No market_instance_id resolved; market_id={} asset_label={} asset_id={} ts_ms={} (storing NULL)",
+                            ev.market_id, ev.asset_label, ev.asset_id, ev.event_ts_ms
+                        );
+                    }
                     insert_polymarket(&mut client, ev, slug.as_deref()).await
                 }
                 DbEvent::Btc(ev) => insert_btc(&mut client, ev).await,
+                DbEvent::CacheSlug { market_id, slug } => {
+                    market_slug_cache.insert(market_id.clone(), Some(slug.clone()));
+                    eprintln!(
+                        "ℹ️  Seeded slug cache; market_id={} slug={}",
+                        market_id, slug
+                    );
+                    Ok(())
+                }
             };
 
             if let Err(e) = result {
@@ -238,8 +270,19 @@ async fn ensure_schema(client: &Client) -> Result<()> {
             ADD COLUMN IF NOT EXISTS market_instance_id TEXT;
             ALTER TABLE polymarket_orderbook_events
             ADD COLUMN IF NOT EXISTS side TEXT;
-            ALTER TABLE polymarket_orderbook_events
-            ADD CONSTRAINT IF NOT EXISTS polymarket_orderbook_events_side_check CHECK (side IN ('UP','DOWN'));
+
+            -- Postgres does not support IF NOT EXISTS for constraints; add defensively.
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'polymarket_orderbook_events_side_check'
+                ) THEN
+                    ALTER TABLE polymarket_orderbook_events
+                    ADD CONSTRAINT polymarket_orderbook_events_side_check CHECK (side IN ('UP','DOWN'));
+                END IF;
+            END$$;
 
             CREATE TABLE IF NOT EXISTS btc_ticks (
                 id BIGSERIAL PRIMARY KEY,
@@ -308,10 +351,34 @@ async fn resolve_market_slug(
     cache: &mut HashMap<String, Option<String>>,
 ) -> Option<String> {
     if let Some(cached) = cache.get(market_id) {
-        return cached.clone();
+        match cached {
+            Some(slug) => {
+                eprintln!(
+                    "ℹ️  Cached market_instance_id hit; market_id={} slug={}",
+                    market_id, slug
+                );
+                return Some(slug.clone());
+            }
+            None => {
+                eprintln!(
+                    "ℹ️  Cached NULL market_instance_id; market_id={} (will re-fetch to inspect body)",
+                    market_id
+                );
+                // fall through to re-fetch so we can log the latest body
+            }
+        }
     }
 
-    let fetched = fetch_market_slug(market_id).await.unwrap_or(None);
+    let fetched = match fetch_market_slug(market_id).await {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!(
+                "⚠️  Failed to fetch market slug for market_id={}: {}; storing NULL",
+                market_id, e
+            );
+            None
+        }
+    };
     cache.insert(market_id.to_string(), fetched.clone());
     fetched
 }
@@ -319,22 +386,202 @@ async fn resolve_market_slug(
 async fn fetch_market_slug(market_id: &str) -> Result<Option<String>> {
     let market_id = market_id.to_string();
     let res = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        let url = format!("{}/markets/{}", GAMMA_API_BASE, market_id);
-        let response = ureq::get(&url)
-            .timeout(Duration::from_secs(10))
-            .call()?;
-
-        if response.status() == 404 {
-            return Ok(None);
+        // Try multiple endpoints and id variants to reduce NULLs. Order matters.
+        // The Gamma API appears to require the `0x` prefix; calling it without
+        // the prefix can return 422 "id is invalid". To avoid noisy warnings,
+        // only try the stripped variant when the original id lacks the prefix.
+        let mut id_variants = Vec::new();
+        if market_id.starts_with("0x") {
+            id_variants.push(market_id.clone());
+        } else {
+            id_variants.push(format!("0x{market_id}"));
+            id_variants.push(market_id.clone());
         }
 
-        let detail: MarketDetail = response.into_json()?;
-        Ok(detail.slug)
+        id_variants.sort();
+        id_variants.dedup();
+
+        let mut endpoints: Vec<String> = Vec::new();
+        for id in &id_variants {
+            // The Polymarket websocket "market id" corresponds to the condition_id.
+            // Querying via condition_ids works even when /markets/{id} rejects.
+            endpoints.push(format!("{}/markets?condition_ids={}", GAMMA_API_BASE, id));
+            endpoints.push(format!("{}/markets/{}", GAMMA_API_BASE, id));
+            endpoints.push(format!("{}/marketInstances/{}", GAMMA_API_BASE, id));
+        }
+
+        for url in endpoints {
+            match fetch_and_extract_slug(&url, &market_id) {
+                Ok(Some(slug)) => {
+                    eprintln!(
+                        "✅  Resolved market_instance_id; market_id={} url={} slug={}",
+                        market_id, url, slug
+                    );
+                    return Ok(Some(slug));
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "ℹ️  No slug at endpoint; market_id={} url={} (will try next endpoint)",
+                        market_id, url
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Slug lookup failed market_id={} url={}: {}", market_id, url, e);
+                    continue;
+                }
+            }
+        }
+
+        Ok(None)
     })
     .await
     .map_err(|e| anyhow::anyhow!("JoinError fetching market slug: {e}"))??;
 
     Ok(res)
+}
+
+fn fetch_and_extract_slug(url: &str, market_id: &str) -> Result<Option<String>> {
+    let response = match ureq::get(url).timeout(Duration::from_secs(10)).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<<failed to read body: {e}>>"));
+            eprintln!(
+                "⚠️  Gamma status error market_id={} url={} status={} body_snip={}",
+                market_id,
+                url,
+                status,
+                snippet(&body)
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "HTTP error market_id={} url={}: {e}",
+                market_id,
+                url
+            ))
+        }
+    };
+
+    let status = response.status();
+    let status_text = response.status_text().to_string();
+    let body = response
+        .into_string()
+        .map_err(|e| anyhow::anyhow!("Read body error market_id={} url={}: {e}", market_id, url))?;
+
+    if status == 404 {
+        eprintln!(
+            "ℹ️  Gamma returned 404 for market_id={} url={} body_snip={}",
+            market_id,
+            url,
+            snippet(&body)
+        );
+        return Ok(None);
+    }
+
+    if status != 200 {
+        eprintln!(
+            "⚠️  Gamma non-200 status={} {} market_id={} url={} body_snip={}",
+            status,
+            status_text,
+            market_id,
+            url,
+            snippet(&body)
+        );
+        return Ok(None);
+    }
+
+    // First, try the typed MarketDetail; fall back to generic traversal.
+    if let Ok(detail) = serde_json::from_str::<MarketDetail>(&body) {
+        if detail.slug.is_none() {
+            eprintln!(
+                "⚠️  Gamma response missing slug; market_id={} url={} status={} body_snip={}",
+                market_id,
+                url,
+                status,
+                snippet(&body)
+            );
+        }
+        if let Some(s) = detail.slug {
+            eprintln!(
+                "✅  Found slug via MarketDetail; market_id={} url={} slug={}",
+                market_id,
+                url,
+                s
+            );
+            return Ok(Some(s));
+        }
+        return Ok(None);
+    }
+
+    let val: Value = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "Parse error market_id={} url={} status={} body_snip={} err={}",
+            market_id,
+            url,
+            status,
+            snippet(&body),
+            e
+        )
+    })?;
+
+    let slug = find_slug_recursive(&val);
+    if let Some(s) = slug.clone() {
+        eprintln!(
+            "✅  Found slug via generic traversal; market_id={} url={} slug={}",
+            market_id,
+            url,
+            s
+        );
+        return Ok(Some(s));
+    } else {
+        eprintln!(
+            "⚠️  No slug found in Gamma body; market_id={} url={} status={} body_snip={}",
+            market_id,
+            url,
+            status,
+            snippet(&body)
+        );
+        return Ok(None);
+    }
+}
+
+fn snippet(body: &str) -> String {
+    const MAX: usize = 800;
+    if body.len() > MAX {
+        format!("{}...[truncated]", &body[..MAX])
+    } else {
+        body.to_string()
+    }
+}
+
+fn find_slug_recursive(value: &Value) -> Option<String> {
+    match value {
+        Value::String(_s) => None,
+        Value::Number(_) | Value::Bool(_) | Value::Null => None,
+        Value::Array(arr) => {
+            for v in arr {
+                if let Some(found) = find_slug_recursive(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get("slug") {
+                return Some(s.clone());
+            }
+            for v in map.values() {
+                if let Some(found) = find_slug_recursive(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+    }
 }
 
 async fn insert_btc(client: &mut Client, ev: &BtcEvent) -> Result<()> {
