@@ -353,10 +353,6 @@ async fn resolve_market_slug(
     if let Some(cached) = cache.get(market_id) {
         match cached {
             Some(slug) => {
-                eprintln!(
-                    "ℹ️  Cached market_instance_id hit; market_id={} slug={}",
-                    market_id, slug
-                );
                 return Some(slug.clone());
             }
             None => {
