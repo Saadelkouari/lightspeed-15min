@@ -1,6 +1,6 @@
 use crate::config::DatabaseConfig;
 use crate::orderbook::Orderbook;
-use crate::btc::BtcTicker;
+use crate::btc::{BtcTicker, BtcKline, BtcMarkPrice};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{self, Value};
@@ -20,6 +20,8 @@ pub struct DbLogger {
 enum DbEvent {
     Polymarket(PolymarketEvent),
     Btc(BtcEvent),
+    BtcKline(BtcKlineEvent),
+    BtcMarkPrice(BtcMarkPriceEvent),
     CacheSlug { market_id: String, slug: String },
 }
 
@@ -41,6 +43,38 @@ struct PolymarketEvent {
 struct BtcEvent {
     price: f64,
     volume: f64,
+    event_ts_ms: i64,
+    received_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct BtcKlineEvent {
+    symbol: String,
+    interval: String,
+    open_time: u64,
+    close_time: u64,
+    open_price: f64,
+    close_price: f64,
+    high_price: f64,
+    low_price: f64,
+    base_volume: f64,
+    quote_volume: f64,
+    number_of_trades: u64,
+    is_closed: bool,
+    taker_buy_base_volume: f64,
+    taker_buy_quote_volume: f64,
+    event_ts_ms: i64,
+    received_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct BtcMarkPriceEvent {
+    symbol: String,
+    mark_price: f64,
+    index_price: f64,
+    estimated_settle_price: f64,
+    funding_rate: f64,
+    next_funding_time: u64,
     event_ts_ms: i64,
     received_at_ms: i64,
 }
@@ -165,6 +199,56 @@ impl DbLogger {
             eprintln!("⚠️  Failed to enqueue BTC tick for DB logging: {e}");
         }
     }
+
+    pub fn log_btc_kline(&self, kline: &BtcKline) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let event = BtcKlineEvent {
+            symbol: kline.symbol.clone(),
+            interval: kline.interval.clone(),
+            open_time: kline.open_time,
+            close_time: kline.close_time,
+            open_price: kline.open_price,
+            close_price: kline.close_price,
+            high_price: kline.high_price,
+            low_price: kline.low_price,
+            base_volume: kline.base_volume,
+            quote_volume: kline.quote_volume,
+            number_of_trades: kline.number_of_trades,
+            is_closed: kline.is_closed,
+            taker_buy_base_volume: kline.taker_buy_base_volume,
+            taker_buy_quote_volume: kline.taker_buy_quote_volume,
+            event_ts_ms: normalize_timestamp_ms(kline.event_time as i64),
+            received_at_ms: kline.received_at_ms as i64,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::BtcKline(event)) {
+            eprintln!("⚠️  Failed to enqueue BTC kline for DB logging: {e}");
+        }
+    }
+
+    pub fn log_btc_mark_price(&self, mark_price: &BtcMarkPrice) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let event = BtcMarkPriceEvent {
+            symbol: mark_price.symbol.clone(),
+            mark_price: mark_price.mark_price,
+            index_price: mark_price.index_price,
+            estimated_settle_price: mark_price.estimated_settle_price,
+            funding_rate: mark_price.funding_rate,
+            next_funding_time: mark_price.next_funding_time,
+            event_ts_ms: normalize_timestamp_ms(mark_price.event_time as i64),
+            received_at_ms: mark_price.received_at_ms as i64,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::BtcMarkPrice(event)) {
+            eprintln!("⚠️  Failed to enqueue BTC mark price for DB logging: {e}");
+        }
+    }
 }
 
 async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedReceiver<DbEvent>) -> Result<()> {
@@ -218,6 +302,8 @@ async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedRecei
                     insert_polymarket(&mut client, ev, slug.as_deref()).await
                 }
                 DbEvent::Btc(ev) => insert_btc(&mut client, ev).await,
+                DbEvent::BtcKline(ev) => insert_btc_kline(&mut client, ev).await,
+                DbEvent::BtcMarkPrice(ev) => insert_btc_mark_price(&mut client, ev).await,
                 DbEvent::CacheSlug { market_id, slug } => {
                     market_slug_cache.insert(market_id.clone(), Some(slug.clone()));
                     eprintln!(
@@ -288,6 +374,40 @@ async fn ensure_schema(client: &Client) -> Result<()> {
                 id BIGSERIAL PRIMARY KEY,
                 price DOUBLE PRECISION NOT NULL,
                 volume DOUBLE PRECISION NOT NULL,
+                event_timestamp_ms BIGINT NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS btc_klines (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time BIGINT NOT NULL,
+                close_time BIGINT NOT NULL,
+                open_price DOUBLE PRECISION NOT NULL,
+                close_price DOUBLE PRECISION NOT NULL,
+                high_price DOUBLE PRECISION NOT NULL,
+                low_price DOUBLE PRECISION NOT NULL,
+                base_volume DOUBLE PRECISION NOT NULL,
+                quote_volume DOUBLE PRECISION NOT NULL,
+                number_of_trades BIGINT NOT NULL,
+                is_closed BOOLEAN NOT NULL,
+                taker_buy_base_volume DOUBLE PRECISION NOT NULL,
+                taker_buy_quote_volume DOUBLE PRECISION NOT NULL,
+                event_timestamp_ms BIGINT NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS btc_mark_prices (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                mark_price DOUBLE PRECISION NOT NULL,
+                index_price DOUBLE PRECISION NOT NULL,
+                estimated_settle_price DOUBLE PRECISION NOT NULL,
+                funding_rate DOUBLE PRECISION NOT NULL,
+                next_funding_time BIGINT NOT NULL,
                 event_timestamp_ms BIGINT NOT NULL,
                 received_at_ms BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -592,6 +712,84 @@ async fn insert_btc(client: &mut Client, ev: &BtcEvent) -> Result<()> {
             ) VALUES ($1,$2,$3,$4)
         "#,
             &[&ev.price, &ev.volume, &ev.event_ts_ms, &ev.received_at_ms],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
+async fn insert_btc_kline(client: &mut Client, ev: &BtcKlineEvent) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO btc_klines (
+                symbol,
+                interval,
+                open_time,
+                close_time,
+                open_price,
+                close_price,
+                high_price,
+                low_price,
+                base_volume,
+                quote_volume,
+                number_of_trades,
+                is_closed,
+                taker_buy_base_volume,
+                taker_buy_quote_volume,
+                event_timestamp_ms,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        "#,
+            &[
+                &ev.symbol,
+                &ev.interval,
+                &(ev.open_time as i64),
+                &(ev.close_time as i64),
+                &ev.open_price,
+                &ev.close_price,
+                &ev.high_price,
+                &ev.low_price,
+                &ev.base_volume,
+                &ev.quote_volume,
+                &(ev.number_of_trades as i64),
+                &ev.is_closed,
+                &ev.taker_buy_base_volume,
+                &ev.taker_buy_quote_volume,
+                &ev.event_ts_ms,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
+async fn insert_btc_mark_price(client: &mut Client, ev: &BtcMarkPriceEvent) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO btc_mark_prices (
+                symbol,
+                mark_price,
+                index_price,
+                estimated_settle_price,
+                funding_rate,
+                next_funding_time,
+                event_timestamp_ms,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        "#,
+            &[
+                &ev.symbol,
+                &ev.mark_price,
+                &ev.index_price,
+                &ev.estimated_settle_price,
+                &ev.funding_rate,
+                &(ev.next_funding_time as i64),
+                &ev.event_ts_ms,
+                &ev.received_at_ms,
+            ],
         )
         .await
         .map(|_| ())

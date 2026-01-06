@@ -21,7 +21,7 @@ use gamma::GammaClient;
 use orderbook::OrderbookState;
 use websocket::WebSocketClient;
 use display::{OrderbookDisplay, BtcDisplay};
-use btc::{BinanceWsClient, BtcTicker, BINANCE_WS_URL};
+use btc::{BinanceWsClient, BtcTicker, BINANCE_WS_URL, BINANCE_WS_URL_KLINE, BINANCE_WS_URL_MARK_PRICE};
 use config::AppConfig;
 use db::DbLogger;
 
@@ -249,16 +249,17 @@ async fn run_btc(config: AppConfig) -> Result<()> {
         );
     }
 
-    // Stream handler
+    // Ticker stream handler (existing, unchanged)
     let ws_client_clone = ws_client.clone();
     let ticker_state_clone = ticker_state.clone();
     let status_clone = status.clone();
+    let db_logger_ticker = db_logger.clone();
     tokio::spawn(async move {
         loop {
             match ws_client_clone.next_ticker().await {
                 Ok(Some(ticker)) => {
                     *ticker_state_clone.write().await = Some(ticker.clone());
-                    db_logger.log_btc_ticker(&ticker);
+                    db_logger_ticker.log_btc_ticker(&ticker);
                     *status_clone.write().await = format!("Last tick @ {}", ticker.last_price);
                 }
                 Ok(None) => {
@@ -275,6 +276,66 @@ async fn run_btc(config: AppConfig) -> Result<()> {
                     *status_clone.write().await = "Binance WS error, retrying…".to_string();
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let _ = ws_client_clone.reconnect().await;
+                }
+            }
+        }
+    });
+
+    // Kline stream handler (new, parallel)
+    let ws_kline = Arc::new(BinanceWsClient::new(BINANCE_WS_URL_KLINE.to_string()));
+    if let Err(e) = ws_kline.connect().await {
+        eprintln!("❌ Failed to connect to Binance kline websocket: {}", e);
+        return Err(e);
+    }
+    let ws_kline_clone = ws_kline.clone();
+    let db_logger_kline = db_logger.clone();
+    tokio::spawn(async move {
+        loop {
+            match ws_kline_clone.next_kline().await {
+                Ok(Some(kline)) => {
+                    db_logger_kline.log_btc_kline(&kline);
+                }
+                Ok(None) => {
+                    if !ws_kline_clone.is_connected().await {
+                        if let Err(e) = ws_kline_clone.reconnect().await {
+                            eprintln!("❌ Binance kline reconnect failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Binance kline WS error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let _ = ws_kline_clone.reconnect().await;
+                }
+            }
+        }
+    });
+
+    // Mark Price stream handler (new, parallel)
+    let ws_mark_price = Arc::new(BinanceWsClient::new(BINANCE_WS_URL_MARK_PRICE.to_string()));
+    if let Err(e) = ws_mark_price.connect().await {
+        eprintln!("❌ Failed to connect to Binance mark price websocket: {}", e);
+        return Err(e);
+    }
+    let ws_mark_price_clone = ws_mark_price.clone();
+    let db_logger_mark_price = db_logger.clone();
+    tokio::spawn(async move {
+        loop {
+            match ws_mark_price_clone.next_mark_price().await {
+                Ok(Some(mark_price)) => {
+                    db_logger_mark_price.log_btc_mark_price(&mark_price);
+                }
+                Ok(None) => {
+                    if !ws_mark_price_clone.is_connected().await {
+                        if let Err(e) = ws_mark_price_clone.reconnect().await {
+                            eprintln!("❌ Binance mark price reconnect failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Binance mark price WS error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let _ = ws_mark_price_clone.reconnect().await;
                 }
             }
         }
@@ -384,7 +445,7 @@ async fn run_logging(config: AppConfig) -> Result<()> {
         }
     });
 
-    // --- BTC setup (no UI) ---
+    // --- BTC ticker setup (no UI) ---
     let ws_btc = Arc::new(BinanceWsClient::new(BINANCE_WS_URL.to_string()));
     ws_btc.connect().await?;
     let btc_counter = counters.btc.clone();
@@ -412,6 +473,66 @@ async fn run_logging(config: AppConfig) -> Result<()> {
             }
         }
     });
+
+    // --- BTC kline setup (no UI, parallel) ---
+    let ws_btc_kline = Arc::new(BinanceWsClient::new(BINANCE_WS_URL_KLINE.to_string()));
+    if let Err(e) = ws_btc_kline.connect().await {
+        eprintln!("❌ Failed to connect to Binance kline websocket: {}", e);
+    } else {
+        let ws_btc_kline_clone = ws_btc_kline.clone();
+        let db_clone_kline = db_logger.clone();
+        tokio::spawn(async move {
+            loop {
+                match ws_btc_kline_clone.next_kline().await {
+                    Ok(Some(kline)) => {
+                        db_clone_kline.log_btc_kline(&kline);
+                    }
+                    Ok(None) => {
+                        if !ws_btc_kline_clone.is_connected().await {
+                            if let Err(e) = ws_btc_kline_clone.reconnect().await {
+                                eprintln!("❌ Binance kline reconnect failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Binance kline WS error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let _ = ws_btc_kline_clone.reconnect().await;
+                    }
+                }
+            }
+        });
+    }
+
+    // --- BTC mark price setup (no UI, parallel) ---
+    let ws_btc_mark_price = Arc::new(BinanceWsClient::new(BINANCE_WS_URL_MARK_PRICE.to_string()));
+    if let Err(e) = ws_btc_mark_price.connect().await {
+        eprintln!("❌ Failed to connect to Binance mark price websocket: {}", e);
+    } else {
+        let ws_btc_mark_price_clone = ws_btc_mark_price.clone();
+        let db_clone_mark_price = db_logger.clone();
+        tokio::spawn(async move {
+            loop {
+                match ws_btc_mark_price_clone.next_mark_price().await {
+                    Ok(Some(mark_price)) => {
+                        db_clone_mark_price.log_btc_mark_price(&mark_price);
+                    }
+                    Ok(None) => {
+                        if !ws_btc_mark_price_clone.is_connected().await {
+                            if let Err(e) = ws_btc_mark_price_clone.reconnect().await {
+                                eprintln!("❌ Binance mark price reconnect failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Binance mark price WS error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let _ = ws_btc_mark_price_clone.reconnect().await;
+                    }
+                }
+            }
+        });
+    }
 
     // --- Status printer ---
     let counters_print = counters.clone();
