@@ -28,3 +28,13 @@ Thumbs.db
 *.log
 *.tmp
 
+# Python / notebooks
+.venv/
+.env
+__pycache__/
+notebooks/.ipynb_checkpoints/
+
+
+
+*.xlsx
+
