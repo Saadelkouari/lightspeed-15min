@@ -1,6 +1,6 @@
+use crate::btc::{BtcKline, BtcTicker};
 use crate::config::DatabaseConfig;
 use crate::orderbook::Orderbook;
-use crate::btc::BtcTicker;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{self, Value};
@@ -19,7 +19,11 @@ pub struct DbLogger {
 #[derive(Debug)]
 enum DbEvent {
     Polymarket(PolymarketEvent),
+    PolymarketBestPrice(PolymarketBestPriceEvent),
     Btc(BtcEvent),
+    BtcKline(BtcKlineEvent),
+    UserTrade(UserTradeEvent),
+    UserOrder(UserOrderEvent),
     CacheSlug { market_id: String, slug: String },
 }
 
@@ -45,10 +49,101 @@ struct BtcEvent {
     received_at_ms: i64,
 }
 
+#[derive(Debug)]
+struct BtcKlineEvent {
+    symbol: String,
+    open_price: f64,
+    high_price: f64,
+    low_price: f64,
+    close_price: f64,
+    volume: f64,
+    start_time_ms: i64,
+    end_time_ms: i64,
+    is_final: bool,
+    event_ts_ms: i64,
+    received_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct PolymarketBestPriceEvent {
+    outcome: Outcome,
+    asset_id: String,
+    market_id: String,
+    best_bid_price: Option<f64>,
+    best_bid_qty: Option<f64>,
+    best_ask_price: Option<f64>,
+    best_ask_qty: Option<f64>,
+    event_ts_ms: i64,
+    received_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct UserTradeEvent {
+    user_address: String,
+    trade_id: String,
+    asset_id: String,
+    market_id: String,
+    outcome: String,
+    side: String,
+    price: Option<f64>,
+    size: Option<f64>,
+    status: String,
+    taker_order_id: String,
+    match_time_ms: i64,
+    last_update_ms: i64,
+    event_ts_ms: i64,
+    owner: String,
+    trade_owner: String,
+    maker_orders: Value,
+    received_at_ms: i64,
+}
+
+#[derive(Debug)]
+struct UserOrderEvent {
+    user_address: String,
+    order_id: String,
+    asset_id: String,
+    market_id: String,
+    outcome: String,
+    side: String,
+    price: Option<f64>,
+    original_size: Option<f64>,
+    size_matched: Option<f64>,
+    order_owner: String,
+    owner: String,
+    order_type: String,
+    event_ts_ms: i64,
+    associate_trades: Value,
+    received_at_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 enum Side {
     Up,
     Down,
+}
+
+#[derive(Debug, Clone)]
+enum Outcome {
+    Yes,
+    No,
+}
+
+impl Outcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Yes => "YES",
+            Outcome::No => "NO",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.to_ascii_lowercase().as_str() {
+            "yes" | "up" => Some(Outcome::Yes),
+            "no" | "down" => Some(Outcome::No),
+            _ => None,
+        }
+    }
 }
 
 impl Side {
@@ -101,7 +196,10 @@ impl DbLogger {
         let side = match asset_label.and_then(Side::from_label) {
             Some(s) => s,
             None => {
-                eprintln!("⚠️  Skipping polymarket log: missing/unknown side for asset_id={}", ob.asset_id);
+                eprintln!(
+                    "⚠️  Skipping polymarket log: missing/unknown side for asset_id={}",
+                    ob.asset_id
+                );
                 return;
             }
         };
@@ -130,6 +228,48 @@ impl DbLogger {
 
         if let Err(e) = self.tx.send(DbEvent::Polymarket(event)) {
             eprintln!("⚠️  Failed to enqueue polymarket event for DB logging: {e}");
+        }
+    }
+
+    pub fn log_polymarket_best_price(&self, ob: &Orderbook, asset_label: Option<&str>) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let outcome = match asset_label.and_then(Outcome::from_label) {
+            Some(outcome) => outcome,
+            None => {
+                eprintln!(
+                    "⚠️  Skipping best price log: missing/unknown outcome for asset_id={}",
+                    ob.asset_id
+                );
+                return;
+            }
+        };
+
+        let best_bid = ob
+            .bids
+            .last()
+            .and_then(|l| l.price.parse::<f64>().ok().zip(l.size.parse::<f64>().ok()));
+        let best_ask = ob
+            .asks
+            .last()
+            .and_then(|l| l.price.parse::<f64>().ok().zip(l.size.parse::<f64>().ok()));
+
+        let event = PolymarketBestPriceEvent {
+            outcome,
+            asset_id: ob.asset_id.clone(),
+            market_id: ob.market.clone(),
+            best_bid_price: best_bid.map(|(p, _)| p),
+            best_bid_qty: best_bid.map(|(_, q)| q),
+            best_ask_price: best_ask.map(|(p, _)| p),
+            best_ask_qty: best_ask.map(|(_, q)| q),
+            event_ts_ms: normalize_timestamp_ms(ob.timestamp),
+            received_at_ms: ob.received_at_ms,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::PolymarketBestPrice(event)) {
+            eprintln!("⚠️  Failed to enqueue best price event for DB logging: {e}");
         }
     }
 
@@ -165,9 +305,131 @@ impl DbLogger {
             eprintln!("⚠️  Failed to enqueue BTC tick for DB logging: {e}");
         }
     }
+
+    pub fn log_btc_kline(&self, kline: &BtcKline) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let event = BtcKlineEvent {
+            symbol: kline.symbol.clone(),
+            open_price: kline.open_price,
+            high_price: kline.high_price,
+            low_price: kline.low_price,
+            close_price: kline.close_price,
+            volume: kline.volume,
+            start_time_ms: normalize_timestamp_ms(kline.start_time as i64),
+            end_time_ms: normalize_timestamp_ms(kline.end_time as i64),
+            is_final: kline.is_final,
+            event_ts_ms: normalize_timestamp_ms(kline.event_time as i64),
+            received_at_ms: kline.received_at_ms as i64,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::BtcKline(event)) {
+            eprintln!("⚠️  Failed to enqueue BTC kline for DB logging: {e}");
+        }
+    }
+
+    pub fn log_user_trade(
+        &self,
+        user_address: &str,
+        trade_id: &str,
+        asset_id: &str,
+        market_id: &str,
+        outcome: &str,
+        side: &str,
+        price: Option<f64>,
+        size: Option<f64>,
+        status: &str,
+        taker_order_id: &str,
+        match_time_ms: i64,
+        last_update_ms: i64,
+        event_ts_ms: i64,
+        owner: &str,
+        trade_owner: &str,
+        maker_orders: Value,
+        received_at_ms: i64,
+    ) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let event = UserTradeEvent {
+            user_address: user_address.to_string(),
+            trade_id: trade_id.to_string(),
+            asset_id: asset_id.to_string(),
+            market_id: market_id.to_string(),
+            outcome: outcome.to_string(),
+            side: side.to_string(),
+            price,
+            size,
+            status: status.to_string(),
+            taker_order_id: taker_order_id.to_string(),
+            match_time_ms,
+            last_update_ms,
+            event_ts_ms,
+            owner: owner.to_string(),
+            trade_owner: trade_owner.to_string(),
+            maker_orders,
+            received_at_ms,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::UserTrade(event)) {
+            eprintln!("⚠️  Failed to enqueue user trade event for DB logging: {e}");
+        }
+    }
+
+    pub fn log_user_order(
+        &self,
+        user_address: &str,
+        order_id: &str,
+        asset_id: &str,
+        market_id: &str,
+        outcome: &str,
+        side: &str,
+        price: Option<f64>,
+        original_size: Option<f64>,
+        size_matched: Option<f64>,
+        order_owner: &str,
+        owner: &str,
+        order_type: &str,
+        event_ts_ms: i64,
+        associate_trades: Value,
+        received_at_ms: i64,
+    ) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let event = UserOrderEvent {
+            user_address: user_address.to_string(),
+            order_id: order_id.to_string(),
+            asset_id: asset_id.to_string(),
+            market_id: market_id.to_string(),
+            outcome: outcome.to_string(),
+            side: side.to_string(),
+            price,
+            original_size,
+            size_matched,
+            order_owner: order_owner.to_string(),
+            owner: owner.to_string(),
+            order_type: order_type.to_string(),
+            event_ts_ms,
+            associate_trades,
+            received_at_ms,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::UserOrder(event)) {
+            eprintln!("⚠️  Failed to enqueue user order event for DB logging: {e}");
+        }
+    }
 }
 
-async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedReceiver<DbEvent>) -> Result<()> {
+async fn run_worker(
+    url: String,
+    auto_create: bool,
+    mut rx: mpsc::UnboundedReceiver<DbEvent>,
+) -> Result<()> {
     let mut pending: Option<DbEvent> = None;
     let mut market_slug_cache: HashMap<String, Option<String>> = HashMap::new();
 
@@ -217,7 +479,13 @@ async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedRecei
                     }
                     insert_polymarket(&mut client, ev, slug.as_deref()).await
                 }
+                DbEvent::PolymarketBestPrice(ev) => {
+                    insert_polymarket_best_price(&mut client, ev).await
+                }
                 DbEvent::Btc(ev) => insert_btc(&mut client, ev).await,
+                DbEvent::BtcKline(ev) => insert_btc_kline(&mut client, ev).await,
+                DbEvent::UserTrade(ev) => insert_user_trade(&mut client, ev).await,
+                DbEvent::UserOrder(ev) => insert_user_order(&mut client, ev).await,
                 DbEvent::CacheSlug { market_id, slug } => {
                     market_slug_cache.insert(market_id.clone(), Some(slug.clone()));
                     eprintln!(
@@ -292,6 +560,78 @@ async fn ensure_schema(client: &Client) -> Result<()> {
                 received_at_ms BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS btc_kline_1m (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                open_price DOUBLE PRECISION NOT NULL,
+                high_price DOUBLE PRECISION NOT NULL,
+                low_price DOUBLE PRECISION NOT NULL,
+                close_price DOUBLE PRECISION NOT NULL,
+                volume DOUBLE PRECISION NOT NULL,
+                start_time_ms BIGINT NOT NULL,
+                end_time_ms BIGINT NOT NULL,
+                is_final BOOLEAN NOT NULL,
+                event_timestamp_ms BIGINT NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS polymarket_best_prices (
+                id BIGSERIAL PRIMARY KEY,
+                outcome TEXT NOT NULL CHECK (outcome IN ('YES','NO')),
+                asset_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                best_bid_price DOUBLE PRECISION,
+                best_bid_qty DOUBLE PRECISION,
+                best_ask_price DOUBLE PRECISION,
+                best_ask_qty DOUBLE PRECISION,
+                event_timestamp_ms BIGINT NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS polymarket_user_trades (
+                id BIGSERIAL PRIMARY KEY,
+                user_address TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price DOUBLE PRECISION,
+                size DOUBLE PRECISION,
+                status TEXT NOT NULL,
+                taker_order_id TEXT NOT NULL,
+                match_time_ms BIGINT NOT NULL,
+                last_update_ms BIGINT NOT NULL,
+                event_timestamp_ms BIGINT NOT NULL,
+                owner TEXT NOT NULL,
+                trade_owner TEXT NOT NULL,
+                maker_orders JSONB NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS polymarket_user_orders (
+                id BIGSERIAL PRIMARY KEY,
+                user_address TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price DOUBLE PRECISION,
+                original_size DOUBLE PRECISION,
+                size_matched DOUBLE PRECISION,
+                order_owner TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                event_timestamp_ms BIGINT NOT NULL,
+                associate_trades JSONB NOT NULL,
+                received_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
         "#,
         )
         .await?;
@@ -326,6 +666,42 @@ async fn insert_polymarket(
                 &ev.asset_id,
                 &ev.market_id,
                 &market_slug,
+                &ev.best_bid_price,
+                &ev.best_bid_qty,
+                &ev.best_ask_price,
+                &ev.best_ask_qty,
+                &ev.event_ts_ms,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
+async fn insert_polymarket_best_price(
+    client: &mut Client,
+    ev: &PolymarketBestPriceEvent,
+) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO polymarket_best_prices (
+                outcome,
+                asset_id,
+                market,
+                best_bid_price,
+                best_bid_qty,
+                best_ask_price,
+                best_ask_qty,
+                event_timestamp_ms,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        "#,
+            &[
+                &ev.outcome.as_str(),
+                &ev.asset_id,
+                &ev.market_id,
                 &ev.best_bid_price,
                 &ev.best_bid_qty,
                 &ev.best_ask_price,
@@ -423,7 +799,10 @@ async fn fetch_market_slug(market_id: &str) -> Result<Option<String>> {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Slug lookup failed market_id={} url={}: {}", market_id, url, e);
+                    eprintln!(
+                        "⚠️  Slug lookup failed market_id={} url={}: {}",
+                        market_id, url, e
+                    );
                     continue;
                 }
             }
@@ -504,9 +883,7 @@ fn fetch_and_extract_slug(url: &str, market_id: &str) -> Result<Option<String>> 
         if let Some(s) = detail.slug {
             eprintln!(
                 "✅  Found slug via MarketDetail; market_id={} url={} slug={}",
-                market_id,
-                url,
-                s
+                market_id, url, s
             );
             return Ok(Some(s));
         }
@@ -528,9 +905,7 @@ fn fetch_and_extract_slug(url: &str, market_id: &str) -> Result<Option<String>> 
     if let Some(s) = slug.clone() {
         eprintln!(
             "✅  Found slug via generic traversal; market_id={} url={} slug={}",
-            market_id,
-            url,
-            s
+            market_id, url, s
         );
         return Ok(Some(s));
     } else {
@@ -598,3 +973,133 @@ async fn insert_btc(client: &mut Client, ev: &BtcEvent) -> Result<()> {
         .map_err(|e| e.into())
 }
 
+async fn insert_btc_kline(client: &mut Client, ev: &BtcKlineEvent) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO btc_kline_1m (
+                symbol,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                start_time_ms,
+                end_time_ms,
+                is_final,
+                event_timestamp_ms,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        "#,
+            &[
+                &ev.symbol,
+                &ev.open_price,
+                &ev.high_price,
+                &ev.low_price,
+                &ev.close_price,
+                &ev.volume,
+                &ev.start_time_ms,
+                &ev.end_time_ms,
+                &ev.is_final,
+                &ev.event_ts_ms,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
+async fn insert_user_trade(client: &mut Client, ev: &UserTradeEvent) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO polymarket_user_trades (
+                user_address,
+                trade_id,
+                asset_id,
+                market,
+                outcome,
+                side,
+                price,
+                size,
+                status,
+                taker_order_id,
+                match_time_ms,
+                last_update_ms,
+                event_timestamp_ms,
+                owner,
+                trade_owner,
+                maker_orders,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        "#,
+            &[
+                &ev.user_address,
+                &ev.trade_id,
+                &ev.asset_id,
+                &ev.market_id,
+                &ev.outcome,
+                &ev.side,
+                &ev.price,
+                &ev.size,
+                &ev.status,
+                &ev.taker_order_id,
+                &ev.match_time_ms,
+                &ev.last_update_ms,
+                &ev.event_ts_ms,
+                &ev.owner,
+                &ev.trade_owner,
+                &ev.maker_orders,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
+async fn insert_user_order(client: &mut Client, ev: &UserOrderEvent) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO polymarket_user_orders (
+                user_address,
+                order_id,
+                asset_id,
+                market,
+                outcome,
+                side,
+                price,
+                original_size,
+                size_matched,
+                order_owner,
+                owner,
+                order_type,
+                event_timestamp_ms,
+                associate_trades,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        "#,
+            &[
+                &ev.user_address,
+                &ev.order_id,
+                &ev.asset_id,
+                &ev.market_id,
+                &ev.outcome,
+                &ev.side,
+                &ev.price,
+                &ev.original_size,
+                &ev.size_matched,
+                &ev.order_owner,
+                &ev.owner,
+                &ev.order_type,
+                &ev.event_ts_ms,
+                &ev.associate_trades,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}

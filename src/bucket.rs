@@ -41,4 +41,3 @@ mod tests {
         assert!(bucket.slug().starts_with("btc-updown-15m-"));
     }
 }
-
