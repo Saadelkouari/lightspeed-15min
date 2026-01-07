@@ -102,10 +102,30 @@ pub enum UserEvent {
     Order(UserOrderMessage),
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct UserAuth {
+    #[serde(rename = "apiKey")]
+    api_key: String,
+    secret: String,
+    passphrase: String,
+}
+
+impl UserAuth {
+    pub fn new(api_key: String, secret: String, passphrase: String) -> Self {
+        Self {
+            api_key,
+            secret,
+            passphrase,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct UserSubscribeMessage {
     #[serde(rename = "type")]
     channel_type: String,
+    auth: UserAuth,
+    markets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,15 +286,17 @@ impl WebSocketClient {
 
 pub struct UserWebSocketClient {
     url: String,
-    api_key: String,
+    auth: UserAuth,
+    markets: Vec<String>,
     stream: Arc<RwLock<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
 }
 
 impl UserWebSocketClient {
-    pub fn new(url: String, api_key: String) -> Self {
+    pub fn new(url: String, auth: UserAuth, markets: Vec<String>) -> Self {
         Self {
             url,
-            api_key,
+            auth,
+            markets,
             stream: Arc::new(RwLock::new(None)),
         }
     }
@@ -293,10 +315,10 @@ impl UserWebSocketClient {
             .insert(USER_AGENT, HeaderValue::from_static("lightspeed-15min/0.1"));
         req.headers_mut().insert(
             "Authorization",
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))?,
+            HeaderValue::from_str(&format!("Bearer {}", self.auth.api_key))?,
         );
         req.headers_mut()
-            .insert("X-Api-Key", HeaderValue::from_str(&self.api_key)?);
+            .insert("X-Api-Key", HeaderValue::from_str(&self.auth.api_key)?);
 
         let (ws_stream, _) = match connect_async(req).await {
             Ok(ok) => ok,
@@ -326,6 +348,8 @@ impl UserWebSocketClient {
     async fn send_user_subscribe(&self) -> Result<()> {
         let msg = UserSubscribeMessage {
             channel_type: "user".to_string(),
+            auth: self.auth.clone(),
+            markets: self.markets.clone(),
         };
         self.send_json(&msg).await
     }
