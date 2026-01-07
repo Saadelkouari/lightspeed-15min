@@ -104,7 +104,7 @@ pub enum UserEvent {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct UserAuth {
-    #[serde(rename = "apikey")]
+    #[serde(rename = "apiKey")]
     api_key: String,
     secret: String,
     passphrase: String,
