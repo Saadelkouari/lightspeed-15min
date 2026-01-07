@@ -67,7 +67,7 @@ pub struct UserTradeMessage {
     pub trade_type: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserMakerOrder {
     pub asset_id: String,
     pub matched_amount: String,

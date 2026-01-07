@@ -19,73 +19,6 @@ fn current_millis() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Debug, Clone)]
-pub struct BtcKline {
-    pub symbol: String,
-    pub open_price: f64,
-    pub high_price: f64,
-    pub low_price: f64,
-    pub close_price: f64,
-    pub volume: f64,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub is_final: bool,
-    pub event_time: u64,
-    pub received_at_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawKlineMessage {
-    #[serde(rename = "e")]
-    event_type: String,
-    #[serde(rename = "E")]
-    event_time: u64,
-    #[serde(rename = "s")]
-    symbol: String,
-    #[serde(rename = "k")]
-    kline: RawKline,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawKline {
-    #[serde(rename = "t")]
-    start_time: u64,
-    #[serde(rename = "T")]
-    end_time: u64,
-    #[serde(rename = "o")]
-    open_price: String,
-    #[serde(rename = "c")]
-    close_price: String,
-    #[serde(rename = "h")]
-    high_price: String,
-    #[serde(rename = "l")]
-    low_price: String,
-    #[serde(rename = "v")]
-    volume: String,
-    #[serde(rename = "x")]
-    is_final: bool,
-}
-
-impl TryFrom<RawKlineMessage> for BtcKline {
-    type Error = anyhow::Error;
-
-    fn try_from(raw: RawKlineMessage) -> Result<Self> {
-        Ok(Self {
-            symbol: raw.symbol,
-            open_price: raw.kline.open_price.parse::<f64>().unwrap_or(0.0),
-            high_price: raw.kline.high_price.parse::<f64>().unwrap_or(0.0),
-            low_price: raw.kline.low_price.parse::<f64>().unwrap_or(0.0),
-            close_price: raw.kline.close_price.parse::<f64>().unwrap_or(0.0),
-            volume: raw.kline.volume.parse::<f64>().unwrap_or(0.0),
-            start_time: raw.kline.start_time,
-            end_time: raw.kline.end_time,
-            is_final: raw.kline.is_final,
-            event_time: raw.event_time,
-            received_at_ms: 0,
-        })
-    }
-}
-
 pub struct BinanceKlineClient {
     url: String,
     stream: Arc<RwLock<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
@@ -120,7 +53,7 @@ impl BinanceKlineClient {
         if let Some(ref mut stream) = *stream_guard {
             match stream.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    match serde_json::from_str::<RawKlineMessage>(&text) {
+                    match serde_json::from_str::<RawKline>(&text) {
                         Ok(raw) => {
                             let mut kline = BtcKline::try_from(raw)?;
                             kline.received_at_ms = current_millis();
