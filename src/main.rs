@@ -27,7 +27,9 @@ use db::DbLogger;
 use display::{BtcDisplay, OrderbookDisplay};
 use gamma::GammaClient;
 use orderbook::OrderbookState;
-use websocket::{UserEvent, UserOrderMessage, UserTradeMessage, UserWebSocketClient, WebSocketClient};
+use websocket::{
+    UserAuth, UserEvent, UserOrderMessage, UserTradeMessage, UserWebSocketClient, WebSocketClient,
+};
 
 // Polymarket CLOB websocket base URL (market channel is /ws/market).
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
@@ -601,6 +603,14 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
         .polymarket_api_key
         .clone()
         .context("POLYMARKET_API_KEY is required for watcher mode")?;
+    let api_secret = config
+        .polymarket_api_secret
+        .clone()
+        .context("POLYMARKET_API_SECRET is required for watcher mode")?;
+    let api_passphrase = config
+        .polymarket_api_passphrase
+        .clone()
+        .context("POLYMARKET_API_PASSPHRASE is required for watcher mode")?;
     let counters = Arc::new(WatcherCounters::new());
     let db_logger = DbLogger::new(&config.database).await?;
 
@@ -610,6 +620,7 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
     let current_bucket = BucketTime::current();
     let (market_info, used_slug) =
         resolve_market_with_fallback(&gamma_client, &current_bucket).await?;
+    let user_market_id = market_info.market_id.clone();
     {
         let mut ob = orderbook_state.write().await;
         ob.set_binary_labels(&market_info.token_ids);
@@ -688,7 +699,12 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
     });
 
     // --- User channel setup ---
-    let user_ws = Arc::new(UserWebSocketClient::new(WS_URL.to_string(), api_key));
+    let user_auth = UserAuth::new(api_key, api_secret, api_passphrase);
+    let user_ws = Arc::new(UserWebSocketClient::new(
+        WS_URL.to_string(),
+        user_auth,
+        vec![user_market_id],
+    ));
     user_ws.connect().await?;
     let user_counter = counters.user_events.clone();
     let db_clone = db_logger.clone();
