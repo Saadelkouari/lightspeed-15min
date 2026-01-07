@@ -17,19 +17,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
-use btc::{BinanceKlineClient, BinanceWsClient, BtcTicker, BINANCE_KLINE_WS_URL, BINANCE_WS_URL};
+use btc::{
+    BinanceKlineClient, BinanceWsClient, BtcTicker, BINANCE_KLINE_WS_URL, BINANCE_WS_URL,
+    BINANCE_WS_URL_KLINE, BINANCE_WS_URL_MARK_PRICE,
+};
 use bucket::BucketTime;
 use config::AppConfig;
 use db::DbLogger;
 use display::{BtcDisplay, OrderbookDisplay};
 use gamma::GammaClient;
 use orderbook::OrderbookState;
-use websocket::WebSocketClient;
-use display::{OrderbookDisplay, BtcDisplay};
-use btc::{BinanceWsClient, BtcTicker, BINANCE_WS_URL, BINANCE_WS_URL_KLINE, BINANCE_WS_URL_MARK_PRICE};
-use config::AppConfig;
-use db::DbLogger;
-use websocket::{UserEvent, UserOrderMessage, UserTradeMessage, UserWebSocketClient};
+use websocket::{UserEvent, UserOrderMessage, UserTradeMessage, UserWebSocketClient, WebSocketClient};
 
 // Polymarket CLOB websocket base URL (market channel is /ws/market).
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
@@ -739,8 +737,8 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
                         kline.high_price,
                         kline.low_price,
                         kline.close_price,
-                        kline.volume,
-                        kline.is_final
+                        kline.base_volume,
+                        kline.is_closed
                     );
                 }
                 Ok(None) => {
