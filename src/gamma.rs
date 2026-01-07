@@ -61,16 +61,13 @@ impl GammaClient {
         }
 
         let url = format!("{}/events/slug/{}", self.base_url, slug);
-        let response = ureq::get(&url)
-            .timeout(Duration::from_secs(10))
-            .call()?;
-        
+        let response = ureq::get(&url).timeout(Duration::from_secs(10)).call()?;
+
         if response.status() == 404 {
             anyhow::bail!("Event not found: {}", slug);
         }
-        
+
         let event: Event = response.into_json()?;
         Ok(event)
     }
 }
-

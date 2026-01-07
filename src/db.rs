@@ -1,3 +1,4 @@
+use crate::btc::{BtcKline, BtcTicker};
 use crate::config::DatabaseConfig;
 use crate::orderbook::Orderbook;
 use crate::btc::{BtcTicker, BtcKline, BtcMarkPrice};
@@ -19,6 +20,7 @@ pub struct DbLogger {
 #[derive(Debug)]
 enum DbEvent {
     Polymarket(PolymarketEvent),
+    PolymarketBestPrice(PolymarketBestPriceEvent),
     Btc(BtcEvent),
     BtcKline(BtcKlineEvent),
     BtcMarkPrice(BtcMarkPriceEvent),
@@ -85,6 +87,29 @@ enum Side {
     Down,
 }
 
+#[derive(Debug, Clone)]
+enum Outcome {
+    Yes,
+    No,
+}
+
+impl Outcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Yes => "YES",
+            Outcome::No => "NO",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.to_ascii_lowercase().as_str() {
+            "yes" | "up" => Some(Outcome::Yes),
+            "no" | "down" => Some(Outcome::No),
+            _ => None,
+        }
+    }
+}
+
 impl Side {
     fn as_str(&self) -> &'static str {
         match self {
@@ -135,7 +160,10 @@ impl DbLogger {
         let side = match asset_label.and_then(Side::from_label) {
             Some(s) => s,
             None => {
-                eprintln!("⚠️  Skipping polymarket log: missing/unknown side for asset_id={}", ob.asset_id);
+                eprintln!(
+                    "⚠️  Skipping polymarket log: missing/unknown side for asset_id={}",
+                    ob.asset_id
+                );
                 return;
             }
         };
@@ -164,6 +192,48 @@ impl DbLogger {
 
         if let Err(e) = self.tx.send(DbEvent::Polymarket(event)) {
             eprintln!("⚠️  Failed to enqueue polymarket event for DB logging: {e}");
+        }
+    }
+
+    pub fn log_polymarket_best_price(&self, ob: &Orderbook, asset_label: Option<&str>) {
+        if !self.cfg.logging_enabled {
+            return;
+        }
+
+        let outcome = match asset_label.and_then(Outcome::from_label) {
+            Some(outcome) => outcome,
+            None => {
+                eprintln!(
+                    "⚠️  Skipping best price log: missing/unknown outcome for asset_id={}",
+                    ob.asset_id
+                );
+                return;
+            }
+        };
+
+        let best_bid = ob
+            .bids
+            .last()
+            .and_then(|l| l.price.parse::<f64>().ok().zip(l.size.parse::<f64>().ok()));
+        let best_ask = ob
+            .asks
+            .last()
+            .and_then(|l| l.price.parse::<f64>().ok().zip(l.size.parse::<f64>().ok()));
+
+        let event = PolymarketBestPriceEvent {
+            outcome,
+            asset_id: ob.asset_id.clone(),
+            market_id: ob.market.clone(),
+            best_bid_price: best_bid.map(|(p, _)| p),
+            best_bid_qty: best_bid.map(|(_, q)| q),
+            best_ask_price: best_ask.map(|(p, _)| p),
+            best_ask_qty: best_ask.map(|(_, q)| q),
+            event_ts_ms: normalize_timestamp_ms(ob.timestamp),
+            received_at_ms: ob.received_at_ms,
+        };
+
+        if let Err(e) = self.tx.send(DbEvent::PolymarketBestPrice(event)) {
+            eprintln!("⚠️  Failed to enqueue best price event for DB logging: {e}");
         }
     }
 
@@ -300,6 +370,9 @@ async fn run_worker(url: String, auto_create: bool, mut rx: mpsc::UnboundedRecei
                         );
                     }
                     insert_polymarket(&mut client, ev, slug.as_deref()).await
+                }
+                DbEvent::PolymarketBestPrice(ev) => {
+                    insert_polymarket_best_price(&mut client, ev).await
                 }
                 DbEvent::Btc(ev) => insert_btc(&mut client, ev).await,
                 DbEvent::BtcKline(ev) => insert_btc_kline(&mut client, ev).await,
@@ -459,6 +532,42 @@ async fn insert_polymarket(
         .map_err(|e| e.into())
 }
 
+async fn insert_polymarket_best_price(
+    client: &mut Client,
+    ev: &PolymarketBestPriceEvent,
+) -> Result<()> {
+    client
+        .execute(
+            r#"
+            INSERT INTO polymarket_best_prices (
+                outcome,
+                asset_id,
+                market,
+                best_bid_price,
+                best_bid_qty,
+                best_ask_price,
+                best_ask_qty,
+                event_timestamp_ms,
+                received_at_ms
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        "#,
+            &[
+                &ev.outcome.as_str(),
+                &ev.asset_id,
+                &ev.market_id,
+                &ev.best_bid_price,
+                &ev.best_bid_qty,
+                &ev.best_ask_price,
+                &ev.best_ask_qty,
+                &ev.event_ts_ms,
+                &ev.received_at_ms,
+            ],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into())
+}
+
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
 #[derive(Deserialize)]
@@ -543,7 +652,10 @@ async fn fetch_market_slug(market_id: &str) -> Result<Option<String>> {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Slug lookup failed market_id={} url={}: {}", market_id, url, e);
+                    eprintln!(
+                        "⚠️  Slug lookup failed market_id={} url={}: {}",
+                        market_id, url, e
+                    );
                     continue;
                 }
             }
@@ -624,9 +736,7 @@ fn fetch_and_extract_slug(url: &str, market_id: &str) -> Result<Option<String>> 
         if let Some(s) = detail.slug {
             eprintln!(
                 "✅  Found slug via MarketDetail; market_id={} url={} slug={}",
-                market_id,
-                url,
-                s
+                market_id, url, s
             );
             return Ok(Some(s));
         }
@@ -648,9 +758,7 @@ fn fetch_and_extract_slug(url: &str, market_id: &str) -> Result<Option<String>> 
     if let Some(s) = slug.clone() {
         eprintln!(
             "✅  Found slug via generic traversal; market_id={} url={} slug={}",
-            market_id,
-            url,
-            s
+            market_id, url, s
         );
         return Ok(Some(s));
     } else {

@@ -11,12 +11,14 @@ pub struct DatabaseConfig {
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
+    pub polymarket_api_key: Option<String>,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             database: DatabaseConfig::from_env()?,
+            polymarket_api_key: env::var("POLYMARKET_API_KEY").ok(),
         })
     }
 }
@@ -46,5 +48,3 @@ impl DatabaseConfig {
         })
     }
 }
-
-

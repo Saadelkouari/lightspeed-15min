@@ -34,24 +34,32 @@ impl OrderbookState {
     }
 
     pub fn update(&mut self, orderbook: Orderbook) {
-        self.orderbooks.insert(orderbook.asset_id.clone(), orderbook);
+        self.orderbooks
+            .insert(orderbook.asset_id.clone(), orderbook);
     }
 
     pub fn get_best_levels(&self) -> Option<(Option<&OrderbookLevel>, Option<&OrderbookLevel>)> {
         // Get the first orderbook (we expect 2, one for YES, one for NO)
         // For display, we'll show the one with the most liquidity
-        let best_orderbook = self.orderbooks.values()
-            .max_by_key(|ob| {
-                let bid_size: f64 = ob.bids.last().and_then(|b| b.size.parse().ok()).unwrap_or(0.0);
-                let ask_size: f64 = ob.asks.last().and_then(|a| a.size.parse().ok()).unwrap_or(0.0);
-                (bid_size + ask_size) as i64
-            })?;
+        let best_orderbook = self.orderbooks.values().max_by_key(|ob| {
+            let bid_size: f64 = ob
+                .bids
+                .last()
+                .and_then(|b| b.size.parse().ok())
+                .unwrap_or(0.0);
+            let ask_size: f64 = ob
+                .asks
+                .last()
+                .and_then(|a| a.size.parse().ok())
+                .unwrap_or(0.0);
+            (bid_size + ask_size) as i64
+        })?;
 
         // API delivers bids ascending (low->high); best bid is last.
         // Asks have been observed descending (high->low); best ask is last.
         let best_bid = best_orderbook.bids.last();
         let best_ask = best_orderbook.asks.last();
-        
+
         Some((best_bid, best_ask))
     }
 
@@ -83,4 +91,3 @@ impl OrderbookState {
         self.orderbooks.clear();
     }
 }
-
