@@ -12,6 +12,8 @@ pub struct DatabaseConfig {
 pub struct AppConfig {
     pub database: DatabaseConfig,
     pub polymarket_api_key: Option<String>,
+    pub polymarket_api_secret: Option<String>,
+    pub polymarket_api_passphrase: Option<String>,
 }
 
 impl AppConfig {
@@ -19,6 +21,8 @@ impl AppConfig {
         Ok(Self {
             database: DatabaseConfig::from_env()?,
             polymarket_api_key: env::var("POLYMARKET_API_KEY").ok(),
+            polymarket_api_secret: env::var("POLYMARKET_API_SECRET").ok(),
+            polymarket_api_passphrase: env::var("POLYMARKET_API_PASSPHRASE").ok(),
         })
     }
 }
