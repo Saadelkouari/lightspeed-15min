@@ -1,10 +1,10 @@
+use crate::btc::BtcTicker;
+use crate::orderbook::OrderbookState;
 use colored::*;
 use crossterm::{cursor, terminal, ExecutableCommand};
 use std::io::{stdout, Write};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::orderbook::OrderbookState;
-use crate::btc::BtcTicker;
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -61,7 +61,11 @@ impl OrderbookDisplay {
         }
     }
 
-    pub async fn update(&mut self, state: &Arc<RwLock<OrderbookState>>, status: &Arc<RwLock<String>>) {
+    pub async fn update(
+        &mut self,
+        state: &Arc<RwLock<OrderbookState>>,
+        status: &Arc<RwLock<String>>,
+    ) {
         let state = state.read().await;
         let orderbooks = state.get_all_orderbooks();
         let now_ms = now_millis();
@@ -79,7 +83,8 @@ impl OrderbookDisplay {
         let summary_lines = 8usize;
         let footer_lines = 2usize;
         let per_ob_fixed_lines = 5usize; // asset+sep+asks label+blank+bids label (levels added separately)
-        let fixed = header_lines + summary_lines + footer_lines + (per_ob_fixed_lines * orderbook_count);
+        let fixed =
+            header_lines + summary_lines + footer_lines + (per_ob_fixed_lines * orderbook_count);
 
         // Remaining lines for levels across all orderbooks (asks+bids)
         let remaining = rows_usize.saturating_sub(fixed).max(2); // ensure at least 1 per side
@@ -93,12 +98,21 @@ impl OrderbookDisplay {
 
         let rule = "═".repeat(cols_usize.saturating_sub(2).max(40));
         lines.push(format!(" {}", rule).bright_cyan().to_string());
-        lines.push("  POLYMARKET BTC 15-MIN UP/DOWN - LIVE ORDERBOOK STREAM".bright_cyan().bold().to_string());
+        lines.push(
+            "  POLYMARKET BTC 15-MIN UP/DOWN - LIVE ORDERBOOK STREAM"
+                .bright_cyan()
+                .bold()
+                .to_string(),
+        );
         lines.push(format!(" {}", rule).bright_cyan().to_string());
         lines.push(String::new());
 
         if orderbooks.is_empty() {
-            lines.push("  Waiting for first orderbook update...".bright_black().to_string());
+            lines.push(
+                "  Waiting for first orderbook update..."
+                    .bright_black()
+                    .to_string(),
+            );
             lines.push(String::new());
         } else {
             for (asset_id, orderbook) in orderbooks.iter() {
@@ -210,7 +224,8 @@ impl OrderbookDisplay {
             ask_str
         ));
         let display_latency = compute_latency_ms(orderbook.timestamp, now_ms);
-        let network_latency = compute_latency_ms_opt(orderbook.timestamp, Some(orderbook.received_at_ms));
+        let network_latency =
+            compute_latency_ms_opt(orderbook.timestamp, Some(orderbook.received_at_ms));
         lines.push(format!(
             "  LATENCY: NET {}   DISP {}",
             render_latency_opt(network_latency),
@@ -219,29 +234,35 @@ impl OrderbookDisplay {
         let thin_rule = "─".repeat(60);
         lines.push(format!(" {}", thin_rule).bright_black().to_string());
         let max_size = self.max_level_size(orderbook);
-        lines.push("      PRICE      SIZE        DEPTH".bright_black().to_string());
+        lines.push(
+            "      PRICE      SIZE        DEPTH"
+                .bright_black()
+                .to_string(),
+        );
         lines.push(String::new());
-        
+
         // Display asks (sell side) best-first (API observed high->low, best = last)
         lines.push("  ASKS (SELL)".bright_red().bold().to_string());
         for ask in orderbook.asks.iter().rev().take(levels_per_side) {
             let price: f64 = ask.price.parse().unwrap_or(0.0);
             let size: f64 = ask.size.parse().unwrap_or(0.0);
-            lines.push(format!("    {} │ {} │ {}", 
+            lines.push(format!(
+                "    {} │ {} │ {}",
                 format!("{:>10.4}", price).bright_red(),
                 format!("{:>12.2}", size).bright_white(),
                 self.size_bar(size, max_size, 40)
             ));
         }
-        
+
         lines.push(String::new());
-        
+
         // Display bids (buy side) best-first (API delivers low->high, best = last)
         lines.push("  BIDS (BUY)".bright_green().bold().to_string());
         for bid in orderbook.bids.iter().rev().take(levels_per_side) {
             let price: f64 = bid.price.parse().unwrap_or(0.0);
             let size: f64 = bid.size.parse().unwrap_or(0.0);
-            lines.push(format!("    {} │ {} │ {}", 
+            lines.push(format!(
+                "    {} │ {} │ {}",
                 format!("{:>10.4}", price).bright_green(),
                 format!("{:>12.2}", size).bright_white(),
                 self.size_bar(size, max_size, 40)
@@ -250,7 +271,9 @@ impl OrderbookDisplay {
     }
 
     fn max_level_size(&self, orderbook: &crate::orderbook::Orderbook) -> f64 {
-        orderbook.asks.iter()
+        orderbook
+            .asks
+            .iter()
             .chain(orderbook.bids.iter())
             .filter_map(|l| l.size.parse::<f64>().ok())
             .fold(1.0, f64::max)
@@ -274,7 +297,11 @@ impl BtcDisplay {
         }
     }
 
-    pub async fn update(&mut self, ticker: &Arc<RwLock<Option<BtcTicker>>>, status: &Arc<RwLock<String>>) {
+    pub async fn update(
+        &mut self,
+        ticker: &Arc<RwLock<Option<BtcTicker>>>,
+        status: &Arc<RwLock<String>>,
+    ) {
         let ticker = ticker.read().await.clone();
         let now_ms = now_millis();
 
@@ -299,33 +326,59 @@ impl BtcDisplay {
             let volume = format!("{:.2}", t.volume);
             let quote_volume = format!("{:.2}", t.quote_volume);
             let display_latency = compute_latency_ms(t.event_time as i64, now_ms);
-            let network_latency = compute_latency_ms_opt(
-                t.event_time as i64,
-                Some(t.received_at_ms as i64)
-            );
+            let network_latency =
+                compute_latency_ms_opt(t.event_time as i64, Some(t.received_at_ms as i64));
 
             lines.push(format!("  SYMBOL: {}", t.symbol.bright_cyan().bold()));
             lines.push(format!("  PRICE: {}", last_price.bright_white().bold()));
-            lines.push(format!("  CHANGE: {} ({})",
-                if change_is_up { change.bright_green() } else { change.bright_red() },
-                if change_is_up { change_pct.bright_green() } else { change_pct.bright_red() },
+            lines.push(format!(
+                "  CHANGE: {} ({})",
+                if change_is_up {
+                    change.bright_green()
+                } else {
+                    change.bright_red()
+                },
+                if change_is_up {
+                    change_pct.bright_green()
+                } else {
+                    change_pct.bright_red()
+                },
             ));
             lines.push(String::new());
-            lines.push(format!("  HIGH: {}   LOW: {}", high.bright_white(), low.bright_white()));
-            lines.push(format!("  VOL: {} BTC   QUOTE VOL: {} USDT", volume.bright_white(), quote_volume.bright_white()));
+            lines.push(format!(
+                "  HIGH: {}   LOW: {}",
+                high.bright_white(),
+                low.bright_white()
+            ));
+            lines.push(format!(
+                "  VOL: {} BTC   QUOTE VOL: {} USDT",
+                volume.bright_white(),
+                quote_volume.bright_white()
+            ));
 
             let seconds = (t.event_time / 1000) % 60;
             let minutes = (t.event_time / 1000 / 60) % 60;
             let hours = (t.event_time / 1000 / 3600) % 24;
             lines.push(String::new());
-            lines.push(format!("  Last Update (UTC): {:02}:{:02}:{:02}", hours, minutes, seconds).bright_black().to_string());
+            lines.push(
+                format!(
+                    "  Last Update (UTC): {:02}:{:02}:{:02}",
+                    hours, minutes, seconds
+                )
+                .bright_black()
+                .to_string(),
+            );
             lines.push(format!(
                 "  Latency: NET {}   DISP {}",
                 render_latency_opt(network_latency),
                 render_latency(display_latency)
             ));
         } else {
-            lines.push("  Waiting for first BTCUSDT tick…".bright_black().to_string());
+            lines.push(
+                "  Waiting for first BTCUSDT tick…"
+                    .bright_black()
+                    .to_string(),
+            );
         }
 
         lines.push(String::new());
@@ -366,4 +419,3 @@ impl BtcDisplay {
         let _ = out.flush();
     }
 }
-

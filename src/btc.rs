@@ -8,12 +8,149 @@ use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub const BINANCE_WS_URL: &str = "wss://fstream.binance.com/ws/btcusdt@ticker";
+pub const BINANCE_KLINE_WS_URL: &str = "wss://fstream.binance.com/ws/btcusdt@kline_1m";
 
 fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[derive(Debug, Clone)]
+pub struct BtcKline {
+    pub symbol: String,
+    pub open_price: f64,
+    pub high_price: f64,
+    pub low_price: f64,
+    pub close_price: f64,
+    pub volume: f64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub is_final: bool,
+    pub event_time: u64,
+    pub received_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawKlineMessage {
+    #[serde(rename = "e")]
+    event_type: String,
+    #[serde(rename = "E")]
+    event_time: u64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "k")]
+    kline: RawKline,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawKline {
+    #[serde(rename = "t")]
+    start_time: u64,
+    #[serde(rename = "T")]
+    end_time: u64,
+    #[serde(rename = "o")]
+    open_price: String,
+    #[serde(rename = "c")]
+    close_price: String,
+    #[serde(rename = "h")]
+    high_price: String,
+    #[serde(rename = "l")]
+    low_price: String,
+    #[serde(rename = "v")]
+    volume: String,
+    #[serde(rename = "x")]
+    is_final: bool,
+}
+
+impl TryFrom<RawKlineMessage> for BtcKline {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: RawKlineMessage) -> Result<Self> {
+        Ok(Self {
+            symbol: raw.symbol,
+            open_price: raw.kline.open_price.parse::<f64>().unwrap_or(0.0),
+            high_price: raw.kline.high_price.parse::<f64>().unwrap_or(0.0),
+            low_price: raw.kline.low_price.parse::<f64>().unwrap_or(0.0),
+            close_price: raw.kline.close_price.parse::<f64>().unwrap_or(0.0),
+            volume: raw.kline.volume.parse::<f64>().unwrap_or(0.0),
+            start_time: raw.kline.start_time,
+            end_time: raw.kline.end_time,
+            is_final: raw.kline.is_final,
+            event_time: raw.event_time,
+            received_at_ms: 0,
+        })
+    }
+}
+
+pub struct BinanceKlineClient {
+    url: String,
+    stream: Arc<RwLock<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+}
+
+impl BinanceKlineClient {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            stream: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn connect(&self) -> Result<()> {
+        let (ws_stream, _) = connect_async(&self.url).await?;
+        *self.stream.write().await = Some(ws_stream);
+        Ok(())
+    }
+
+    pub async fn reconnect(&self) -> Result<()> {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.connect().await
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.stream.read().await.is_some()
+    }
+
+    pub async fn next_kline(&self) -> Result<Option<BtcKline>> {
+        let mut stream_guard = self.stream.write().await;
+
+        if let Some(ref mut stream) = *stream_guard {
+            match stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<RawKlineMessage>(&text) {
+                        Ok(raw) => {
+                            let mut kline = BtcKline::try_from(raw)?;
+                            kline.received_at_ms = current_millis();
+                            Ok(Some(kline))
+                        }
+                        Err(_) => Ok(None),
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = stream.send(Message::Pong(payload)).await;
+                    Ok(None)
+                }
+                Some(Ok(Message::Pong(_))) => Ok(None),
+                Some(Ok(Message::Binary(_))) => Ok(None),
+                Some(Ok(Message::Frame(_))) => Ok(None),
+                Some(Ok(Message::Close(_))) => {
+                    *stream_guard = None;
+                    Ok(None)
+                }
+                Some(Err(e)) => {
+                    *stream_guard = None;
+                    Err(anyhow::anyhow!("Binance WS error: {}", e))
+                }
+                None => {
+                    *stream_guard = None;
+                    Ok(None)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +249,7 @@ impl BinanceWsClient {
                             let mut ticker = BtcTicker::try_from(raw)?;
                             ticker.received_at_ms = current_millis();
                             Ok(Some(ticker))
-                        },
+                        }
                         Err(_) => Ok(None), // ignore unknown payloads
                     }
                 }
@@ -141,4 +278,3 @@ impl BinanceWsClient {
         }
     }
 }
-
