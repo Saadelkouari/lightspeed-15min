@@ -27,9 +27,7 @@ use db::DbLogger;
 use display::{BtcDisplay, OrderbookDisplay};
 use gamma::GammaClient;
 use orderbook::OrderbookState;
-use websocket::{
-    UserAuth, UserEvent, UserOrderMessage, UserTradeMessage, UserWebSocketClient, WebSocketClient,
-};
+use websocket::{UserAuth, UserEvent, UserWebSocketClient, WebSocketClient};
 
 // Polymarket CLOB websocket base URL (market channel is /ws/market).
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com";
@@ -191,11 +189,12 @@ async fn run_polymarket(config: AppConfig) -> Result<()> {
     let ws_client_roll = ws_client.clone();
     let orderbook_state_roll = orderbook_state.clone();
     let status_roll = status.clone();
+    let used_slug_rollover = used_slug.clone();
     tokio::spawn(async move {
         let mut rollover_check = interval(Duration::from_secs(5));
         let mut current_market_info = market_info;
         let mut current_bucket_ts = current_bucket.timestamp();
-        let mut current_slug = used_slug;
+        let mut current_slug = used_slug_rollover;
 
         loop {
             rollover_check.tick().await;
@@ -440,11 +439,12 @@ async fn run_logging(config: AppConfig) -> Result<()> {
     let gamma_client_roll = gamma_client.clone();
     let ws_client_roll = ws_client.clone();
     let orderbook_state_roll = orderbook_state.clone();
+    let used_slug_rollover = used_slug.clone();
     tokio::spawn(async move {
         let mut rollover_check = interval(Duration::from_secs(5));
         let mut current_market_info = market_info;
         let mut current_bucket_ts = current_bucket.timestamp();
-        let mut current_slug = used_slug;
+        let mut current_slug = used_slug_rollover;
 
         loop {
             rollover_check.tick().await;
@@ -620,7 +620,6 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
     let current_bucket = BucketTime::current();
     let (market_info, used_slug) =
         resolve_market_with_fallback(&gamma_client, &current_bucket).await?;
-    let user_market_id = market_info.market_id.clone();
     {
         let mut ob = orderbook_state.write().await;
         ob.set_binary_labels(&market_info.token_ids);
@@ -650,11 +649,12 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
     let gamma_client_roll = gamma_client.clone();
     let ws_client_roll = ws_client.clone();
     let orderbook_state_roll = orderbook_state.clone();
+    let used_slug_rollover = used_slug;
     tokio::spawn(async move {
         let mut rollover_check = interval(Duration::from_secs(5));
         let mut current_market_info = market_info;
         let mut current_bucket_ts = current_bucket.timestamp();
-        let mut current_slug = used_slug;
+        let mut current_slug = used_slug_rollover;
 
         loop {
             rollover_check.tick().await;
@@ -700,11 +700,7 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
 
     // --- User channel setup ---
     let user_auth = UserAuth::new(api_key, api_secret, api_passphrase);
-    let user_ws = Arc::new(UserWebSocketClient::new(
-        WS_URL.to_string(),
-        user_auth,
-        vec![user_market_id],
-    ));
+    let user_ws = Arc::new(UserWebSocketClient::new(WS_URL.to_string(), user_auth));
     user_ws.connect().await?;
     let user_counter = counters.user_events.clone();
     let db_clone = db_logger.clone();
@@ -713,10 +709,18 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
         loop {
             match user_ws_clone.receive_message().await {
                 Ok(Some(message)) => {
-                    if let Some(event) = websocket::parse_user_message(&message) {
-                        if process_user_event(WATCHER_USER_ADDRESS, event, &db_clone, &user_counter)
-                        {
-                            println!("✅ User event stored for {WATCHER_USER_ADDRESS}");
+                    match websocket::parse_user_message(&message) {
+                        Ok(Some(event)) => {
+                            process_user_event(
+                                WATCHER_USER_ADDRESS,
+                                event,
+                                &db_clone,
+                                &user_counter,
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("❌ User channel parse error: {e} | payload={message}");
                         }
                     }
                 }
@@ -841,6 +845,7 @@ fn find_valid_market(event: &gamma::Event) -> Option<gamma::MarketInfo> {
         .and_then(|m| {
             parse_token_ids(&m.clob_token_ids).map(|ids| gamma::MarketInfo {
                 market_id: m.id.clone(),
+                condition_id: m.condition_id.clone(),
                 token_ids: ids,
             })
         })
@@ -901,23 +906,6 @@ fn normalize_outcome_label(label: &str) -> Option<&'static str> {
     }
 }
 
-fn matches_address(address: &str, candidate: &str) -> bool {
-    address.eq_ignore_ascii_case(candidate)
-}
-
-fn trade_matches_user(address: &str, trade: &UserTradeMessage) -> bool {
-    matches_address(address, &trade.owner)
-        || matches_address(address, &trade.trade_owner)
-        || trade
-            .maker_orders
-            .iter()
-            .any(|order| matches_address(address, &order.owner))
-}
-
-fn order_matches_user(address: &str, order: &UserOrderMessage) -> bool {
-    matches_address(address, &order.owner) || matches_address(address, &order.order_owner)
-}
-
 fn format_price_level(price: Option<f64>, qty: Option<f64>) -> String {
     match (price, qty) {
         (Some(p), Some(q)) => format!("{p} @ {q}"),
@@ -934,9 +922,6 @@ fn process_user_event(
     let received_at_ms = current_millis_i64();
     match event {
         UserEvent::Trade(trade) => {
-            if !trade_matches_user(address, &trade) {
-                return false;
-            }
             let maker_orders = serde_json::to_value(&trade.maker_orders).unwrap_or(Value::Null);
             db_logger.log_user_trade(
                 address,
@@ -971,11 +956,9 @@ fn process_user_event(
             true
         }
         UserEvent::Order(order) => {
-            if !order_matches_user(address, &order) {
-                return false;
-            }
             let associate_trades =
                 serde_json::to_value(&order.associate_trades).unwrap_or(Value::Null);
+            let timestamp_ms = parse_timestamp_ms(&order.timestamp);
             db_logger.log_user_order(
                 address,
                 &order.id,
@@ -989,19 +972,17 @@ fn process_user_event(
                 &order.order_owner,
                 &order.owner,
                 &order.order_type,
-                parse_timestamp_ms(&order.timestamp),
+                timestamp_ms,
                 associate_trades,
                 received_at_ms,
             );
             println!(
-                "USER ORDER | id={} market={} outcome={} side={} price={} matched={}/{} type={}",
-                order.id,
-                order.market,
+                "USER ORDER | ts_ms={} outcome={} side={} price={} matched={} type={}",
+                timestamp_ms,
                 order.outcome,
                 order.side,
                 order.price,
                 order.size_matched,
-                order.original_size,
                 order.order_type
             );
             counter.fetch_add(1, Ordering::Relaxed);

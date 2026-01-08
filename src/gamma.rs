@@ -10,6 +10,7 @@ pub struct GammaClient {
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     pub market_id: String,
+    pub condition_id: String,
     pub token_ids: Vec<String>,
 }
 
@@ -23,6 +24,8 @@ pub struct Event {
 #[derive(Debug, Deserialize)]
 pub struct Market {
     pub id: String,
+    #[serde(rename = "conditionId")]
+    pub condition_id: String,
     #[serde(rename = "enableOrderBook")]
     pub enable_order_book: Option<bool>,
     #[serde(rename = "acceptingOrders")]

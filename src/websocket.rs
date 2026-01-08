@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, ORIGIN, USER_AGENT};
 use tokio_tungstenite::MaybeTlsStream;
@@ -125,7 +126,6 @@ struct UserSubscribeMessage {
     #[serde(rename = "type")]
     channel_type: String,
     auth: UserAuth,
-    markets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +157,7 @@ impl WebSocketClient {
         let ws_url = self.market_ws_url();
 
         // Cloudflare often expects a browser-like Origin header.
+        let ws_url_log = ws_url.clone();
         let mut req = ws_url.into_client_request()?;
         req.headers_mut()
             .insert(ORIGIN, HeaderValue::from_static("https://polymarket.com"));
@@ -178,6 +179,7 @@ impl WebSocketClient {
             }
         };
         *self.stream.write().await = Some(ws_stream);
+        eprintln!("✅ WebSocket connected: market channel {}", ws_url_log);
 
         // Initial subscription message on open
         self.send_initial_market_subscribe().await?;
@@ -274,7 +276,11 @@ impl WebSocketClient {
                 }
                 Some(Err(e)) => {
                     *stream_guard = None;
-                    Err(anyhow::anyhow!("WebSocket error: {}", e))
+                    if is_reset_without_close(&e) {
+                        Ok(None)
+                    } else {
+                        Err(anyhow::anyhow!("WebSocket error: {}", e))
+                    }
                 }
                 _ => Ok(None),
             }
@@ -287,16 +293,14 @@ impl WebSocketClient {
 pub struct UserWebSocketClient {
     url: String,
     auth: UserAuth,
-    markets: Vec<String>,
     stream: Arc<RwLock<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
 }
 
 impl UserWebSocketClient {
-    pub fn new(url: String, auth: UserAuth, markets: Vec<String>) -> Self {
+    pub fn new(url: String, auth: UserAuth) -> Self {
         Self {
             url,
             auth,
-            markets,
             stream: Arc::new(RwLock::new(None)),
         }
     }
@@ -308,17 +312,12 @@ impl UserWebSocketClient {
     pub async fn connect(&self) -> Result<()> {
         let ws_url = self.user_ws_url();
 
+        let ws_url_log = ws_url.clone();
         let mut req = ws_url.into_client_request()?;
         req.headers_mut()
             .insert(ORIGIN, HeaderValue::from_static("https://polymarket.com"));
         req.headers_mut()
             .insert(USER_AGENT, HeaderValue::from_static("lightspeed-15min/0.1"));
-        req.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Bearer {}", self.auth.api_key))?,
-        );
-        req.headers_mut()
-            .insert("X-Api-Key", HeaderValue::from_str(&self.auth.api_key)?);
 
         let (ws_stream, _) = match connect_async(req).await {
             Ok(ok) => ok,
@@ -334,8 +333,10 @@ impl UserWebSocketClient {
             }
         };
         *self.stream.write().await = Some(ws_stream);
+        eprintln!("✅ WebSocket connected: user channel {}", ws_url_log);
 
         self.send_user_subscribe().await?;
+        eprintln!("✅ User channel subscribed");
         self.spawn_ping_loop();
         Ok(())
     }
@@ -349,7 +350,6 @@ impl UserWebSocketClient {
         let msg = UserSubscribeMessage {
             channel_type: "user".to_string(),
             auth: self.auth.clone(),
-            markets: self.markets.clone(),
         };
         self.send_json(&msg).await
     }
@@ -391,7 +391,11 @@ impl UserWebSocketClient {
                 }
                 Some(Err(e)) => {
                     *stream_guard = None;
-                    Err(anyhow::anyhow!("WebSocket error: {}", e))
+                    if is_reset_without_close(&e) {
+                        Ok(None)
+                    } else {
+                        Err(anyhow::anyhow!("WebSocket error: {}", e))
+                    }
                 }
                 _ => Ok(None),
             }
@@ -438,16 +442,35 @@ pub fn parse_orderbook_message(message: &str) -> Option<Orderbook> {
     })
 }
 
-pub fn parse_user_message(message: &str) -> Option<UserEvent> {
-    let value: serde_json::Value = serde_json::from_str(message).ok()?;
-    let event_type = value.get("event_type")?.as_str()?;
+fn is_reset_without_close(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        err,
+        tokio_tungstenite::tungstenite::Error::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )
+    )
+}
+
+pub fn parse_user_message(message: &str) -> Result<Option<UserEvent>> {
+    let trimmed = message.trim();
+    if trimmed.eq_ignore_ascii_case("pong") || trimmed.eq_ignore_ascii_case("ping") {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(message).context("user channel message is not valid JSON")?;
+    let event_type = value
+        .get("event_type")
+        .and_then(|t| t.as_str())
+        .context("user channel message missing event_type")?;
     match event_type {
         "trade" => serde_json::from_value::<UserTradeMessage>(value)
-            .ok()
-            .map(UserEvent::Trade),
+            .map(UserEvent::Trade)
+            .map(Some)
+            .context("user channel trade payload invalid"),
         "order" => serde_json::from_value::<UserOrderMessage>(value)
-            .ok()
-            .map(UserEvent::Order),
-        _ => None,
+            .map(UserEvent::Order)
+            .map(Some)
+            .context("user channel order payload invalid"),
+        _ => Ok(None),
     }
 }
