@@ -14,7 +14,8 @@ use std::env;
 use std::io::stdout;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
 use btc::{
@@ -26,7 +27,7 @@ use config::AppConfig;
 use db::DbLogger;
 use display::{BtcDisplay, OrderbookDisplay};
 use gamma::GammaClient;
-use orderbook::OrderbookState;
+use orderbook::{Orderbook, OrderbookState};
 use websocket::{UserAuth, UserEvent, UserWebSocketClient, WebSocketClient};
 
 // Polymarket CLOB websocket base URL (market channel is /ws/market).
@@ -616,6 +617,7 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
 
     // --- Polymarket orderbook setup (no UI) ---
     let orderbook_state = Arc::new(RwLock::new(OrderbookState::new()));
+    let trade_task_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let gamma_client = Arc::new(GammaClient::new(GAMMA_API_BASE.to_string()));
     let current_bucket = BucketTime::current();
     let (market_info, used_slug) =
@@ -632,12 +634,14 @@ async fn run_watcher(config: AppConfig) -> Result<()> {
     let orderbook_state_clone = orderbook_state.clone();
     let db_clone = db_logger.clone();
     let ws_client_clone = ws_client.clone();
+    let trade_task_handle_clone = trade_task_handle.clone();
     tokio::spawn(async move {
         if let Err(e) = handle_watcher_orderbook_messages(
             ws_client_clone,
             orderbook_state_clone,
             db_clone,
             orderbook_counter,
+            trade_task_handle_clone,
         )
         .await
         {
@@ -991,11 +995,32 @@ fn process_user_event(
     }
 }
 
+async fn spawn_trade_task_if_idle(
+    trade_task_handle: &Arc<Mutex<Option<JoinHandle<()>>>>,
+    orderbook: Orderbook,
+) {
+    let mut handle_guard = trade_task_handle.lock().await;
+    if let Some(handle) = handle_guard.as_ref() {
+        if !handle.is_finished() {
+            return;
+        }
+    }
+
+    *handle_guard = None;
+    let handle = tokio::spawn(async move {
+        run_trade_task(orderbook).await;
+    });
+    *handle_guard = Some(handle);
+}
+
+async fn run_trade_task(_orderbook: Orderbook) {}
+
 async fn handle_watcher_orderbook_messages(
     ws_client: Arc<WebSocketClient>,
     orderbook_state: Arc<RwLock<OrderbookState>>,
     db_logger: DbLogger,
     counter: Arc<AtomicU64>,
+    trade_task_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
     loop {
         match ws_client.receive_message().await {
@@ -1038,7 +1063,9 @@ async fn handle_watcher_orderbook_messages(
                         );
                     }
 
+                    let trade_ob = ob.clone();
                     orderbook_state.write().await.update(ob);
+                    spawn_trade_task_if_idle(&trade_task_handle, trade_ob).await;
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
